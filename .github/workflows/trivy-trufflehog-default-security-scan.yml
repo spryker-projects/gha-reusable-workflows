@@ -1,0 +1,50 @@
+name: ECR vulnerability detection
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        required: true
+        type: string
+      dockerfile:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string
+      platforms:
+        required: false
+        default: linux/amd64
+        type: string
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --platform ${{ inputs.platforms }} \
+            -t ${{ inputs.image }} \
+            -f ${{ inputs.context }}/${{ inputs.dockerfile }} .
+      - name: Scan Docker image with Trufflehog
+        continue-on-error: false
+        run: |
+          docker run --rm trufflesecurity/trufflehog:latest docker \
+            --image ${{ inputs.image }} \
+            --only-verified
+      - name: Scan Docker image with Trivy
+        if: ${{ !startsWith(inputs.image, 'spryker/jenkins') && !startsWith(inputs.image, 'spryker/rabbitmq') }}
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: "${{ inputs.image }}"
+          exit-code: '1'
+          severity: 'LOW,MEDIUM,HIGH,CRITICAL'
+          ignore-unfixed: true
+
+      - name: Show scan result
+        run: |
+          echo "Trivy scan completed for ${{ inputs.image }}"
