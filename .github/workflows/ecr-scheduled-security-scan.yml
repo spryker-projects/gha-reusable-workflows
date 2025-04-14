@@ -1,0 +1,118 @@
+name: Reusable ECR Vulnerability Scan
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
+      platforms:
+        required: true
+        type: string
+      image_type:
+        required: true
+        type: string
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_REGION:
+        required: true
+      AWS_ACCOUNT_ID:
+        required: true
+      AWS_ECR_REPO:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
+
+jobs:
+  scan-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to AWS ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        id: docker-build
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          file: ${{ inputs.image }}
+          tags: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.AWS_ECR_REPO }}:${{ inputs.tag }}-${{ github.sha }}
+          platforms: ${{ inputs.platforms }}
+
+      - name: Scan Docker image
+        id: docker-scan
+        uses: alexjurkiewicz/ecr-scan-image@v2.0.0
+        with:
+          repository: ${{ secrets.AWS_ECR_REPO }}
+          tag: ${{ inputs.tag }}-${{ github.sha }}
+        continue-on-error: true
+
+      - name: Delete images after scan
+        run: |
+          aws ecr batch-delete-image --repository-name ${{ secrets.AWS_ECR_REPO }} --image-id imageTag="${{ inputs.tag }}-${{ github.sha }}"
+
+      - run: |
+          echo "${{ steps.docker-scan.outputs.total }} total vulnerabilities."
+
+      - name: Set Date and Time
+        id: set-date
+        run: echo "current_datetime=$(date +'%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+
+      - name: Set Color
+        id: set-color
+        run: |
+          if [[ "${{ steps.docker-scan.outputs.total }}" == "0" ]]; then
+            echo "color=#008000" >> "$GITHUB_OUTPUT"
+          else
+            echo "color=#ff0000" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare Slack status message
+        id: status-message
+        run: |
+          if [ -z "${{ steps.docker-scan.outputs.total }}" ]; then
+            echo "status_message=No scan output available. Image may not be supported." >> "$GITHUB_OUTPUT"
+          else
+            echo "status_message=*${{ steps.docker-scan.outputs.total }}* total vulnerabilities" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send GitHub Action trigger data to Slack workflow
+        id: slack
+        uses: slackapi/slack-github-action@v2
+        with:
+          payload: |
+            {
+              "text": "Scanned ${{ inputs.image_type }} image tag *${{ inputs.tag }}*.",
+              "attachments": [
+                {
+                  "pretext": "ECR vulnerability scan outputs for ${{ steps.set-date.outputs.current_datetime }}",
+                  "color": "${{ steps.set-color.outputs.color }}",
+                  "fields": [
+                    {
+                      "title": "Status",
+                      "short": true,
+                      "value": "${{ steps.status-message.outputs.status_message }}"
+                    }
+                  ]
+                }
+              ]
+            }
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+
+      - name: Fail the execution
+        if: ${{ steps.docker-scan.outputs.total > 0 }}
+        run: exit 1
